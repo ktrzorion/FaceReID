@@ -1,0 +1,33 @@
+# Use the official Python 3.10 image as a base image
+FROM python:3.10.12-slim
+
+# Set environment variables to ensure that Python output is logged
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Install system dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libgl1-mesa-glx libglib2.0-0 && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Set the working directory inside the container
+WORKDIR /application
+
+# Copy the requirements.txt into the container
+COPY requirements.txt /application/
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install DeepFace (required for your application)
+RUN pip install --no-cache-dir deepface
+
+# Copy the rest of the application code into the container
+COPY . /application/
+
+# Expose port 8000 for FastAPI (default FastAPI port)
+EXPOSE 5000
+
+# Run the FastAPI app using uvicorn
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5000", "--reload"]
