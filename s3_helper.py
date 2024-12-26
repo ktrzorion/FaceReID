@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class S3Helper:
@@ -153,3 +153,66 @@ class S3Helper:
         except Exception as e:
             logging.error(f"Unexpected error listing files: {str(e)}")
             return []
+        
+    def check_file_exists(self, object_name):
+        """Check if a file exists in S3"""
+        try:
+            self.s3_client.head_object(Bucket=self.s3_bucket, Key=object_name)
+            return True
+        except ClientError:
+            return False
+        
+    def download_file(self, object_name, file_path):
+        """Download a file from S3"""
+        try:
+            self.s3_client.download_file(self.s3_bucket, object_name, file_path)
+            return True
+        except ClientError as e:
+            logger.error(f"Failed to download file from S3: {str(e)}")
+            return False
+        
+    def delete_file(self, object_name):
+        """Delete a file from S3"""
+        try:
+            self.s3_client.delete_object(Bucket=self.s3_bucket, Key=object_name)
+            return True
+        except ClientError as e:
+            logger.error(f"Failed to delete file from S3: {str(e)}")
+            return False
+
+    def list_files(self, prefix=''):
+        """List all files in the S3 bucket with given prefix"""
+        try:
+            response = self.s3_client.list_objects_v2(
+                Bucket=self.s3_bucket,
+                Prefix=prefix
+            )
+            return [obj['Key'] for obj in response.get('Contents', [])]
+        except ClientError as e:
+            logger.error(f"Failed to list files in S3: {str(e)}")
+            return []
+
+    def delete_images_by_prefix(self, prefix):
+        """Delete all images with a given prefix"""
+        try:
+            # Get list of all objects with prefix
+            objects_to_delete = self.list_files(prefix)
+            
+            if not objects_to_delete:
+                return True
+                
+            # Delete objects in batches of 1000 (S3 limit)
+            for i in range(0, len(objects_to_delete), 1000):
+                batch = objects_to_delete[i:i + 1000]
+                delete_dict = {'Objects': [{'Key': key} for key in batch]}
+                
+                self.s3_client.delete_objects(
+                    Bucket=self.s3_bucket,
+                    Delete=delete_dict
+                )
+                
+            return True
+        except ClientError as e:
+            logger.error(f"Failed to batch delete files from S3: {str(e)}")
+            return False
+            

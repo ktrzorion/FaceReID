@@ -23,7 +23,8 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Constants
-S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
+IMAGE_DIR = os.environ.get('IMAGE_DIR', 'img/')
+S3_BUCKET_NAME = os.environ.get('S3_BUCKET')
 S3_IMAGE_FOLDER = os.environ.get('S3_IMAGE_FOLDER', 'images/')
 EMBEDDING_DIR = os.environ.get('EMBEDDING_DIR')
 INDEX_FILE = os.path.join(EMBEDDING_DIR, "faiss_index.bin")
@@ -47,7 +48,6 @@ class FaceProcessor:
         self.detection_backends = ['retinaface', 'mtcnn', 'opencv', 'ssd']
         
     def detect_and_crop_face(self, image_path):
-        print(image_path, "---------------!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!---------------!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         for backend in self.detection_backends:
             try:
                 # Read the original image
@@ -95,8 +95,8 @@ class FaceProcessor:
                 debug_path = os.path.join(working_directory, f"debug_{backend}.jpg")
                 cv2.imwrite(debug_path, debug_img)
                                 
-                logger.info(f"Face detected using {backend} backend. Cropped face saved to {cropped_path}")
-                logger.info(f"Debug image with facial area outline saved to {debug_path}")
+                logger.debug(f"Face detected using {backend} backend. Cropped face saved to {cropped_path}")
+                logger.debug(f"Debug image with facial area outline saved to {debug_path}")
                 
                 return cropped_path
                 
@@ -285,12 +285,6 @@ index_manager = ImageIndexManager()
 face_embedding_manager = FaceEmbeddingManager()
 s3_helper = S3Helper()
 
-def normalize_vector(v):
-    norm = np.linalg.norm(v)
-    if norm == 0:
-        return v
-    return v / norm
-
 def save_index_and_mapping():
     # Save index and mapping to temporary location
     temp_index_path = "/tmp/faiss_index.bin"
@@ -339,7 +333,115 @@ def upload_file(self, file_bytes, object_name):
         self.s3_client.put_object(Body=file_bytes, Bucket=self.s3_bucket, Key=object_name)
     except ClientError as e:
         return False
-    return True    
+    return True
+
+@app.post("/rebuild_vector")
+async def rebuild_vector_mapping():
+    """
+    Rebuild vector mapping from S3 images when server restarts.
+    Downloads images from S3, processes faces, and rebuilds the FAISS index.
+    """
+    logger.info("Starting vector mapping rebuild from S3 images...")
+    temp_dir = "/tmp/rebuild_vectors"
+    
+    try:
+        logger.info(f"S3_BUCKET_NAME: {os.environ.get('S3_BUCKET_NAME')}")
+        logger.info(f"S3_IMAGE_FOLDER: {os.environ.get('S3_IMAGE_FOLDER')}")
+        # Validate S3 bucket name
+        if not S3_BUCKET_NAME:
+            logger.error("S3_BUCKET_NAME environment variable is not set")
+            return
+            
+        if not isinstance(S3_BUCKET_NAME, str):
+            logger.error(f"Invalid S3_BUCKET_NAME type: {type(S3_BUCKET_NAME)}. Expected string.")
+            return
+            
+        # Validate S3 image folder
+        if not S3_IMAGE_FOLDER:
+            logger.error("S3_IMAGE_FOLDER environment variable is not set")
+            return
+            
+        # Create temporary directory
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        try:
+            # Test S3 connection
+            s3_helper.s3_client.head_bucket(Bucket=S3_BUCKET_NAME)
+        except Exception as e:
+            logger.error(f"Error connecting to S3 bucket {S3_BUCKET_NAME}: {str(e)}")
+            return
+        
+        # List all images in S3 bucket folder
+        try:
+            image_objects = s3_helper.s3_client.list_objects_v2(
+                Bucket=S3_BUCKET_NAME,
+                Prefix=S3_IMAGE_FOLDER
+            )
+        except Exception as e:
+            logger.error(f"Error listing objects in S3 bucket: {str(e)}")
+            return
+        
+        if 'Contents' not in image_objects:
+            logger.info("No images found in S3 bucket folder")
+            return
+            
+        total_images = len(image_objects['Contents'])
+        logger.info(f"Found {total_images} images in S3 bucket")
+        
+        # Reset index and mapping
+        face_embedding_manager.index = faiss.IndexFlatL2(DIMENSION)
+        face_embedding_manager.vector_to_image_map = {}
+        
+        # Process each image with tqdm progress bar
+        from tqdm import tqdm
+        
+        for obj in tqdm(image_objects['Contents'], 
+                       total=total_images,
+                       desc="Processing images",
+                       unit="img"):
+            s3_path = obj['Key']
+            local_path = os.path.join(temp_dir, os.path.basename(s3_path))
+            
+            try:
+                # Download image from S3
+                s3_helper.s3_client.download_file(
+                    Bucket=S3_BUCKET_NAME,
+                    Key=s3_path,
+                    Filename=local_path
+                )
+                
+                # Generate embedding
+                embedding = face_embedding_manager.get_robust_embedding(local_path)
+                if embedding is None:
+                    logger.warning(f"Could not generate embedding for {s3_path}")
+                    continue
+                    
+                # Add to index
+                new_index = face_embedding_manager.add_embedding(embedding, s3_path)
+                logger.debug(f"Processed {s3_path} (index: {new_index})")
+                
+            except Exception as e:
+                logger.error(f"Error processing {s3_path}: {str(e)}")
+                continue
+            finally:
+                # Clean up temporary file
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+                    
+        # Save rebuilt index and mapping
+        index_manager.index = face_embedding_manager.index
+        index_manager.vector_to_image_map = face_embedding_manager.vector_to_image_map
+        index_manager.save_index_and_mapping()
+        
+        logger.info(f"Vector mapping rebuild complete. Processed {total_images} images.")
+        
+    except Exception as e:
+        logger.error(f"Error during vector mapping rebuild: {str(e)}")
+        raise
+    finally:
+        # Clean up temporary directory
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
 
 @app.post("/store_image")
 async def store_image(image_request: ImageRequest, image_path: str = Body(...)):
@@ -373,9 +475,14 @@ async def store_image(image_request: ImageRequest, image_path: str = Body(...)):
         embedding = face_embedding_manager.get_robust_embedding(temp_image_path)
         if embedding is None:
             raise ValueError("Failed to generate face embedding")
+        
+        # Extract only the image name from the provided path
+        image_name = os.path.basename(image_path)
+        if not image_name:
+            raise ValueError("Invalid image name: image_path must contain a file name")
 
         # Upload original image to S3
-        s3_path = f"{S3_IMAGE_FOLDER}{image_path}"
+        s3_path = f"{S3_IMAGE_FOLDER}{image_name}"
         if not s3_helper.upload_file(temp_image_path, s3_path):
             raise HTTPException(
                 status_code=500,
@@ -434,7 +541,7 @@ async def compare_image(image_request: ImageRequest):
         if not is_matched:
             return {
                 "is_matched": False,
-                "message": "No matching face found above the threshold"
+                "message": "No matching face found"
             }
 
         # Generate presigned URL for the matched image
@@ -459,6 +566,11 @@ async def compare_image(image_request: ImageRequest):
     finally:
         if os.path.exists(temp_image_path):
             os.remove(temp_image_path)     
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Starting server...")
+    await rebuild_vector_mapping()
     
 if __name__ == '__main__':
     app.run(host = '0.0.0.0',debug=True)
